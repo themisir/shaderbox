@@ -40,6 +40,8 @@ struct State {
     light_buffer: wgpu::Buffer,
     light_render_pipeline: wgpu::RenderPipeline,
     light_bind_group: wgpu::BindGroup,
+    debug_material: model::Material,
+    use_debug_material: bool,
 }
 
 impl State {
@@ -115,6 +117,7 @@ impl State {
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
+                    // diffuse
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -130,6 +133,23 @@ impl State {
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         // This should match the filterable field of the
                         // corresponding Texture entry above.
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // normal map
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
@@ -298,6 +318,36 @@ impl State {
                 .await
                 .unwrap();
 
+        let debug_material = {
+            let diffuse_bytes = include_bytes!("../res/cobble-diffuse.png");
+            let normal_bytes = include_bytes!("../res/cobble-normal.png");
+
+            let diffuse_texture = texture::Texture::from_bytes(
+                &device,
+                &queue,
+                diffuse_bytes,
+                "res/alt-diffuse.png",
+                false,
+            )
+            .unwrap();
+            let normal_texture = texture::Texture::from_bytes(
+                &device,
+                &queue,
+                normal_bytes,
+                "res/alt-normal.png",
+                true,
+            )
+            .unwrap();
+
+            model::Material::new(
+                &device,
+                "alt-material",
+                diffuse_texture,
+                normal_texture,
+                &texture_bind_group_layout,
+            )
+        };
+
         Self {
             window,
             surface,
@@ -319,6 +369,9 @@ impl State {
             light_buffer,
             light_render_pipeline,
             light_bind_group,
+            #[allow(dead_code)]
+            debug_material,
+            use_debug_material: false,
         }
     }
 
@@ -339,7 +392,29 @@ impl State {
     }
 
     fn input(&mut self, event: &WindowEvent) -> bool {
-        self.camera_controller.process_events(event)
+        if self.camera_controller.process_events(event) {
+            return true;
+        }
+
+        match event {
+            WindowEvent::KeyboardInput {
+                input:
+                    KeyboardInput {
+                        state,
+                        virtual_keycode: Some(VirtualKeyCode::Space),
+                        ..
+                    },
+                ..
+            } => {
+                self.use_debug_material = match state {
+                    ElementState::Pressed => true,
+                    ElementState::Released => false,
+                };
+
+                true
+            }
+            _ => false,
+        }
     }
 
     fn update(&mut self) {
@@ -411,12 +486,23 @@ impl State {
             );
 
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.draw_model_instanced(
-                &self.obj_model,
-                0..self.instances.len() as u32,
-                &self.camera_bind_group,
-                &self.light_bind_group,
-            );
+
+            if self.use_debug_material {
+                render_pass.draw_model_instanced_with_material(
+                    &self.obj_model,
+                    &self.debug_material,
+                    0..self.instances.len() as u32,
+                    &self.camera_bind_group,
+                    &self.light_bind_group,
+                );
+            } else {
+                render_pass.draw_model_instanced(
+                    &self.obj_model,
+                    0..self.instances.len() as u32,
+                    &self.camera_bind_group,
+                    &self.light_bind_group,
+                );
+            }
         }
 
         // submit will accept anything that implements IntoIter
