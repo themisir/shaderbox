@@ -5,11 +5,11 @@ mod model;
 mod resources;
 mod texture;
 
-use camera::{Camera, CameraController, CameraUniform};
 use cgmath::prelude::*;
 use instance::{Instance, InstanceRaw};
 use light::LightUniform;
 use model::{DrawLight, DrawModel, Vertex};
+use std::time;
 use wgpu::util::DeviceExt;
 use winit::{
     event::*,
@@ -17,7 +17,27 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
-const NUM_INSTANCES_PER_ROW: u32 = 10;
+#[repr(C)]
+// This is so we can store this in a buffer
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CameraUniform {
+    view_position: [f32; 4],
+    view_proj: [[f32; 4]; 4],
+}
+
+impl CameraUniform {
+    pub fn new() -> Self {
+        Self {
+            view_position: [0.0; 4],
+            view_proj: cgmath::Matrix4::identity().into(),
+        }
+    }
+
+    fn update_view_proj(&mut self, camera: &camera::Camera, projection: &camera::Projection) {
+        self.view_position = camera.position.to_homogeneous().into();
+        self.view_proj = (projection.calc_matrix() * camera.calc_matrix()).into();
+    }
+}
 
 struct State {
     surface: wgpu::Surface,
@@ -28,8 +48,9 @@ struct State {
     window: Window,
     render_pipeline: wgpu::RenderPipeline,
     depth_texture: texture::Texture,
-    camera: Camera,
-    camera_controller: CameraController,
+    camera: camera::Camera,
+    projection: camera::Projection,
+    camera_controller: camera::CameraController,
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -42,6 +63,7 @@ struct State {
     light_bind_group: wgpu::BindGroup,
     debug_material: model::Material,
     use_debug_material: bool,
+    mouse_pressed: bool,
 }
 
 impl State {
@@ -157,24 +179,13 @@ impl State {
                 label: Some("texture_bind_group_layout"),
             });
 
-        let camera = Camera {
-            // position the camera one unit up and 2 units back
-            // +z is out of the screen
-            eye: (0.0, 1.0, 2.0).into(),
-            // have it look at the origin
-            target: (0.0, 0.0, 0.0).into(),
-            // which way is "up"
-            up: cgmath::Vector3::unit_y(),
-            aspect: config.width as f32 / config.height as f32,
-            fovy: 45.0,
-            znear: 0.1,
-            zfar: 100.0,
-        };
-
-        let camera_controller = CameraController::new(0.2);
+        let camera = camera::Camera::new((0.0, 5.0, 10.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
+        let projection =
+            camera::Projection::new(config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0);
+        let camera_controller = camera::CameraController::new(4.0, 0.4);
 
         let mut camera_uniform = CameraUniform::new();
-        camera_uniform.update_view_proj(&camera);
+        camera_uniform.update_view_proj(&camera, &projection);
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera Buffer"),
@@ -206,7 +217,9 @@ impl State {
             label: Some("camera_bind_group"),
         });
 
+        const NUM_INSTANCES_PER_ROW: u32 = 10;
         const SPACE_BETWEEN: f32 = 3.0;
+
         let instances = (0..NUM_INSTANCES_PER_ROW)
             .flat_map(|z| {
                 (0..NUM_INSTANCES_PER_ROW).map(move |x| {
@@ -358,6 +371,7 @@ impl State {
             render_pipeline,
             depth_texture,
             camera,
+            projection,
             camera_uniform,
             camera_buffer,
             camera_bind_group,
@@ -372,6 +386,7 @@ impl State {
             #[allow(dead_code)]
             debug_material,
             use_debug_material: false,
+            mouse_pressed: false,
         }
     }
 
@@ -389,37 +404,51 @@ impl State {
             self.depth_texture =
                 texture::Texture::create_depth_texture(&self.device, &self.config, "depth_texture");
         }
+
+        self.projection.resize(new_size.width, new_size.height);
     }
 
     fn input(&mut self, event: &WindowEvent) -> bool {
-        if self.camera_controller.process_events(event) {
-            return true;
-        }
-
         match event {
             WindowEvent::KeyboardInput {
                 input:
                     KeyboardInput {
+                        virtual_keycode: Some(key),
                         state,
-                        virtual_keycode: Some(VirtualKeyCode::Space),
                         ..
                     },
                 ..
-            } => {
-                self.use_debug_material = match state {
-                    ElementState::Pressed => true,
-                    ElementState::Released => false,
-                };
+            } => match key {
+                VirtualKeyCode::F => {
+                    self.use_debug_material = match state {
+                        ElementState::Pressed => true,
+                        ElementState::Released => false,
+                    };
 
+                    true
+                }
+                key => self.camera_controller.process_keyboard(*key, *state),
+            },
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.camera_controller.process_scroll(delta);
+                true
+            }
+            WindowEvent::MouseInput {
+                button: MouseButton::Left,
+                state,
+                ..
+            } => {
+                self.mouse_pressed = *state == ElementState::Pressed;
                 true
             }
             _ => false,
         }
     }
 
-    fn update(&mut self) {
-        self.camera_controller.update_camera(&mut self.camera);
-        self.camera_uniform.update_view_proj(&self.camera);
+    fn update(&mut self, dt: time::Duration) {
+        self.camera_controller.update_camera(&mut self.camera, dt);
+        self.camera_uniform
+            .update_view_proj(&self.camera, &self.projection);
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -428,10 +457,11 @@ impl State {
 
         // Update the light
         let old_position: cgmath::Vector3<_> = self.light_uniform.position.into();
-        self.light_uniform.position =
-            (cgmath::Quaternion::from_axis_angle((0.0, 1.0, 0.0).into(), cgmath::Deg(1.0))
-                * old_position)
-                .into();
+        self.light_uniform.position = (cgmath::Quaternion::from_axis_angle(
+            (0.0, 1.0, 0.0).into(),
+            cgmath::Deg(60.0 * dt.as_secs_f32()),
+        ) * old_position)
+            .into();
         self.queue.write_buffer(
             &self.light_buffer,
             0,
@@ -580,37 +610,46 @@ pub async fn run() {
         .unwrap();
 
     let mut state = State::new(window).await;
+    let mut last_render_time = time::Instant::now();
 
     event_loop.run(move |event, _, control_flow| match event {
+        Event::DeviceEvent {
+            event: DeviceEvent::MouseMotion { delta },
+            ..
+        } => {
+            if state.mouse_pressed {
+                state.camera_controller.process_mouse(delta.0, delta.1)
+            }
+        }
         Event::WindowEvent {
             ref event,
             window_id,
-        } if window_id == state.window().id() => {
-            if !state.input(event) {
-                match event {
-                    WindowEvent::CloseRequested
-                    | WindowEvent::KeyboardInput {
-                        input:
-                            KeyboardInput {
-                                state: ElementState::Pressed,
-                                virtual_keycode: Some(VirtualKeyCode::Escape),
-                                ..
-                            },
+        } if window_id == state.window().id() && !state.input(event) => match event {
+            WindowEvent::CloseRequested
+            | WindowEvent::KeyboardInput {
+                input:
+                    KeyboardInput {
+                        state: ElementState::Pressed,
+                        virtual_keycode: Some(VirtualKeyCode::Escape),
                         ..
-                    } => *control_flow = ControlFlow::Exit,
-                    WindowEvent::Resized(physical_size) => {
-                        state.resize(*physical_size);
-                    }
-                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                        // new_inner_size is &&mut so we have to dereference it twice
-                        state.resize(**new_inner_size);
-                    }
-                    _ => {}
-                }
+                    },
+                ..
+            } => *control_flow = ControlFlow::Exit,
+            WindowEvent::Resized(physical_size) => {
+                state.resize(*physical_size);
             }
-        }
+            WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                // new_inner_size is &&mut so we have to dereference it twice
+                state.resize(**new_inner_size);
+            }
+            _ => {}
+        },
         Event::RedrawRequested(window_id) if window_id == state.window().id() => {
-            state.update();
+            let now = time::Instant::now();
+            let dt = now.duration_since(last_render_time);
+            last_render_time = now;
+            state.update(dt);
+
             match state.render() {
                 Ok(_) => {}
                 // Reconfigure the surface if lost
